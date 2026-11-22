@@ -1,0 +1,347 @@
+name: Build AutoReel APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir AutoReel && cd AutoReel
+          mkdir -p app
+          cat > app/build.gradle.kts <<'AUTOREEL_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.autoreel"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.autoreel"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          AUTOREEL_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'AUTOREEL_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="AutoReel" android:theme="@style/Theme.AutoReel">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".AutoScrollService"
+                      android:exported="true"
+                      android:label="AutoReel"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+                  <service
+                      android:name=".ToggleTile"
+                      android:exported="true"
+                      android:icon="@android:drawable/ic_media_play"
+                      android:label="AutoReel"
+                      android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+                      <intent-filter>
+                          <action android:name="android.service.quicksettings.action.QS_TILE" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          AUTOREEL_EOF
+          mkdir -p app/src/main/java/com/example/autoreel
+          cat > app/src/main/java/com/example/autoreel/AutoScrollService.kt <<'AUTOREEL_EOF'
+          package com.example.autoreel
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          /**
+           * Every 400 ms: if a supported app is on screen, look for the video's progress bar.
+           *  - Progress bar found  -> swipe up when it reaches the end (or loops back to the start).
+           *  - Not found           -> fall back to a timer (seconds set in the app).
+           */
+          class AutoScrollService : AccessibilityService() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var lastSwipe = 0L
+              private var prevRatio = -1f
+              private var lastPkg = ""
+
+              private val apps = mapOf(
+                  "com.zhiliaoapp.musically" to "tiktok",
+                  "com.ss.android.ugc.trill" to "tiktok",
+                  "com.google.android.youtube" to "youtube",
+                  "com.facebook.katana" to "facebook",
+                  "com.facebook.lite" to "facebook"
+              )
+
+              private class ScanResult { var ratio = -1f; var reelHint = false; var count = 0 }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      try { step() } catch (_: Exception) {}
+                      handler.postDelayed(this, 400)
+                  }
+              }
+
+              override fun onServiceConnected() { handler.post(tick) }
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+              override fun onDestroy() { handler.removeCallbacks(tick); super.onDestroy() }
+
+              private fun step() {
+                  if (!Prefs.enabled(this)) { prevRatio = -1f; return }
+                  val root = rootInActiveWindow ?: return
+                  val pkg = root.packageName?.toString() ?: return
+                  val key = apps[pkg]
+                  val now = SystemClock.uptimeMillis()
+                  if (key == null || !Prefs.appOn(this, key)) { prevRatio = -1f; lastPkg = ""; return }
+                  if (pkg != lastPkg) { lastPkg = pkg; lastSwipe = now; prevRatio = -1f }
+
+                  val scan = ScanResult()
+                  walk(root, scan, 0)
+                  // YouTube has lots of non-Shorts screens, so only act when a Shorts player is visible.
+                  if (key == "youtube" && !scan.reelHint) return
+                  if (now - lastSwipe < 1800) { prevRatio = -1f; return }
+
+                  var swipe = false
+                  val r = scan.ratio
+                  if (r >= 0f) {
+                      if (r >= 0.97f) swipe = true
+                      else if (prevRatio > 0.85f && r < 0.2f) swipe = true   // video looped
+                      prevRatio = r
+                  } else if (now - lastSwipe >= Prefs.fallback(this) * 1000L) {
+                      swipe = true
+                  }
+                  if (swipe) swipeUp()
+              }
+
+              private fun walk(n: AccessibilityNodeInfo?, s: ScanResult, depth: Int) {
+                  if (n == null || s.count > 800 || depth > 40) return
+                  s.count++
+                  val id = n.viewIdResourceName
+                  if (id != null && (id.contains("reel", true) || id.contains("shorts", true))) s.reelHint = true
+                  val ri = n.rangeInfo
+                  if (ri != null && s.ratio < 0f && ri.max > ri.min) {
+                      val b = Rect(); n.getBoundsInScreen(b)
+                      if (b.width() > resources.displayMetrics.widthPixels * 0.6) {
+                          s.ratio = ((ri.current - ri.min) / (ri.max - ri.min)).coerceIn(0f, 1f)
+                      }
+                  }
+                  for (i in 0 until n.childCount) walk(n.getChild(i), s, depth + 1)
+              }
+
+              private fun swipeUp() {
+                  val m = resources.displayMetrics
+                  val x = m.widthPixels * 0.5f
+                  val path = Path().apply {
+                      moveTo(x, m.heightPixels * 0.72f)
+                      lineTo(x, m.heightPixels * 0.28f)
+                  }
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 220))
+                      .build()
+                  dispatchGesture(g, null, null)
+                  lastSwipe = SystemClock.uptimeMillis()
+                  prevRatio = -1f
+              }
+          }
+          AUTOREEL_EOF
+          mkdir -p app/src/main/java/com/example/autoreel
+          cat > app/src/main/java/com/example/autoreel/MainActivity.kt <<'AUTOREEL_EOF'
+          package com.example.autoreel
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(28), dp(20), dp(20))
+                  }
+                  fun label(t: String, size: Float = 15f, bold: Boolean = false) = TextView(this).apply {
+                      text = t; textSize = size
+                      if (bold) setTypeface(null, Typeface.BOLD)
+                      setPadding(0, dp(8), 0, dp(4))
+                  }
+                  fun sw(t: String, on: Boolean, onChange: (Boolean) -> Unit) = Switch(this).apply {
+                      text = t; isChecked = on; textSize = 16f
+                      setPadding(0, dp(10), 0, dp(10))
+                      setOnCheckedChangeListener { _, v -> onChange(v) }
+                  }
+
+                  col.addView(label("AutoReel", 28f, true))
+                  col.addView(label("Auto-swipes TikTok, YouTube Shorts and Facebook Reels when a video ends."))
+                  status = label("", 15f, true); col.addView(status)
+
+                  col.addView(Button(this).apply {
+                      text = "1. Turn on accessibility permission"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+
+                  col.addView(label("2. Controls", 18f, true))
+                  col.addView(sw("Auto-scroll ON", Prefs.enabled(this)) { Prefs.setEnabled(this, it) })
+                  col.addView(sw("TikTok", Prefs.appOn(this, "tiktok")) { Prefs.setAppOn(this, "tiktok", it) })
+                  col.addView(sw("YouTube Shorts", Prefs.appOn(this, "youtube")) { Prefs.setAppOn(this, "youtube", it) })
+                  col.addView(sw("Facebook Reels", Prefs.appOn(this, "facebook")) { Prefs.setAppOn(this, "facebook", it) })
+
+                  col.addView(label("Backup timer (used if the app hides its progress bar)", 15f, true))
+                  val secLabel = label("", 15f)
+                  val bar = SeekBar(this).apply {
+                      max = 55; progress = Prefs.fallback(this@MainActivity) - 5
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                              secLabel.text = "Swipe after ${p + 5} seconds"
+                              Prefs.setFallback(this@MainActivity, p + 5)
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  }
+                  secLabel.text = "Swipe after ${bar.progress + 5} seconds"
+                  col.addView(bar); col.addView(secLabel)
+                  col.addView(label("Tip: add the AutoReel tile to your Quick Settings panel to pause/resume without opening this app.", 13f))
+
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val on = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+                      ?.contains(packageName) == true
+                  status.text = if (on) "Accessibility: ON \u2705" else "Accessibility: OFF \u274C (tap the button below)"
+                  status.gravity = Gravity.START
+              }
+          }
+          AUTOREEL_EOF
+          mkdir -p app/src/main/java/com/example/autoreel
+          cat > app/src/main/java/com/example/autoreel/Prefs.kt <<'AUTOREEL_EOF'
+          package com.example.autoreel
+
+          import android.content.Context
+
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+              fun enabled(c: Context) = sp(c).getBoolean("enabled", false)
+              fun setEnabled(c: Context, v: Boolean) = sp(c).edit().putBoolean("enabled", v).apply()
+              fun appOn(c: Context, key: String) = sp(c).getBoolean("app_$key", true)
+              fun setAppOn(c: Context, key: String, v: Boolean) = sp(c).edit().putBoolean("app_$key", v).apply()
+              fun fallback(c: Context) = sp(c).getInt("fallback", 20)
+              fun setFallback(c: Context, v: Int) = sp(c).edit().putInt("fallback", v).apply()
+          }
+          AUTOREEL_EOF
+          mkdir -p app/src/main/java/com/example/autoreel
+          cat > app/src/main/java/com/example/autoreel/ToggleTile.kt <<'AUTOREEL_EOF'
+          package com.example.autoreel
+
+          import android.service.quicksettings.Tile
+          import android.service.quicksettings.TileService
+
+          class ToggleTile : TileService() {
+              override fun onStartListening() = refresh()
+              override fun onClick() {
+                  Prefs.setEnabled(this, !Prefs.enabled(this))
+                  refresh()
+              }
+              private fun refresh() {
+                  qsTile?.let {
+                      it.state = if (Prefs.enabled(this)) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+                      it.updateTile()
+                  }
+              }
+          }
+          AUTOREEL_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'AUTOREEL_EOF'
+          <resources>
+              <string name="service_desc">Watches TikTok, YouTube Shorts and Facebook Reels and swipes up to the next video when the current one ends. It does not read or store any personal content.</string>
+          </resources>
+          AUTOREEL_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'AUTOREEL_EOF'
+          <resources>
+              <style name="Theme.AutoReel" parent="android:Theme.Material.Light.NoActionBar" />
+          </resources>
+          AUTOREEL_EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'AUTOREEL_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="200"
+              android:description="@string/service_desc" />
+          AUTOREEL_EOF
+          cat > build.gradle.kts <<'AUTOREEL_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          AUTOREEL_EOF
+          cat > gradle.properties <<'AUTOREEL_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          AUTOREEL_EOF
+          cat > settings.gradle.kts <<'AUTOREEL_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AutoReel"
+          include(":app")
+          AUTOREEL_EOF
+      - name: Build APK
+        run: cd AutoReel && gradle assembleDebug --no-daemon
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp AutoReel/app/build/outputs/apk/debug/app-debug.apk AutoReel.apk
+          gh release create "build-${{ github.run_number }}" AutoReel.apk --title "AutoReel build ${{ github.run_number }}" --notes "Download AutoReel.apk below and install it on your Android phone."
